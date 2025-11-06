@@ -1,0 +1,10 @@
+torch>=1.12
+torchvision
+transformers
+tqdm
+Pillow
+nltk
+numpy
+pycocotools
+# Optional for CIDEr reward (if pip install fails try manual install)
+# pip install git+https://github.com/salaniz/pycocoevalcap.git@master

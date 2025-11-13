@@ -1,221 +1,174 @@
+#!/usr/bin/env python3
+"""
+CaptionPatchDataset with collate_fn.
+Encodes captions on-the-fly using tokenizer_utils.text_to_ids (consistent with vocab.json).
+Loads per-image features (.npy/.npz/.pt/.pth) and returns (feats_tensor, tgt_tensor, img_id).
+"""
 import os
-import re
-from collections import Counter
-from PIL import Image
-from torch.utils.data import Dataset
-import torchvision.transforms as T
+import json
+import numpy as np
+from typing import Dict, List, Any, Tuple
+from pathlib import Path
+
 import torch
-import glob
+from torch.utils.data import Dataset
 
-class Vocabulary:
-    """
-    Lightweight tokenizer-based vocabulary using regex tokenization (no NLTK dependency).
-    """
-    def __init__(self, min_freq=1, specials=['<pad>', '<start>', '<end>', '<unk>']):
-        self.min_freq = min_freq
-        self.freq = Counter()
-        self.itos = []
-        self.stoi = {}
-        self.specials = list(specials)
+from tokenizer_utils import load_tokenizer, text_to_ids
 
-    @staticmethod
-    def _tokenize(text):
-        # Simple fast tokenizer: words and punctuation
-        # lowercase, capture words/numbers and punctuation tokens
-        return re.findall(r"[A-Za-z0-9']+|[^\sA-Za-z0-9']", text.lower())
-
-    def build(self, sentences):
-        for s in sentences:
-            tokens = self._tokenize(s)
-            self.freq.update(tokens)
-        # start with specials
-        self.itos = list(self.specials)
-        for word, cnt in self.freq.most_common():
-            if cnt >= self.min_freq and word not in self.specials:
-                self.itos.append(word)
-        self.stoi = {w: i for i, w in enumerate(self.itos)}
-
-    def __len__(self):
-        return len(self.itos)
-
-    def encode_sentence(self, s, max_len=30):
-        tokens = self._tokenize(s)
-        start_idx = self.stoi.get('<start>')
-        end_idx = self.stoi.get('<end>')
-        unk_idx = self.stoi.get('<unk>')
-        ids = [start_idx]
-        for t in tokens[: max_len - 2]:
-            ids.append(self.stoi.get(t, unk_idx))
-        ids.append(end_idx)
-        # pad will be handled by dataset/collate
-        return ids
-
-    def decode_ids(self, ids):
-        words = []
-        for i in ids:
-            if i < len(self.itos):
-                w = self.itos[i]
+def _load_json_captions(path: str) -> Dict[str, List[str]]:
+    data = json.load(open(path, "r", encoding="utf-8"))
+    mapping = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, list):
+                mapping[str(k)] = [str(x).strip() for x in v]
             else:
-                w = '<unk>'
-            if w in ('<start>', '<end>', '<pad>'):
+                mapping[str(k)] = [str(v).strip()]
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            if not isinstance(item, dict):
                 continue
-            words.append(w)
-        return ' '.join(words)
+            caption = None
+            img_id = None
+            for key in ("caption", "captions", "text"):
+                if key in item:
+                    caption = item[key]
+                    break
+            for key in ("image", "img", "image_id", "file_name", "filename"):
+                if key in item:
+                    img_id = item[key]
+                    break
+            if img_id is None:
+                img_id = str(idx)
+            if isinstance(caption, list):
+                mapping[str(img_id)] = [str(x).strip() for x in caption]
+            elif caption is not None:
+                mapping[str(img_id)] = [str(caption).strip()]
+    else:
+        raise ValueError("Unsupported captions JSON structure: must be dict or list")
+    return mapping
 
-class SimpleVocab:
-    # Giả định class đã có các thuộc tính sau:
-    # self.stoi: dict mapping token -> idx
-    # self.pad_idx: int index cho padding
-    # self.unk_idx: int index cho unknown token
-    # (Nếu chưa có, hãy tạo chúng trong __init__)
-
-    def encode_sentence(self, sentence, max_len=None, add_eos=False, eos_token='<eos>'):
-        """
-        Chuyển sentence (string) -> tensor chỉ số độ dài max_len.
-        - sentence: string
-        - max_len: int hoặc None. Nếu None, trả về độ dài token hiện có.
-        - add_eos: nếu True, thêm token eos (và tính vào max_len).
-        - Trả về: torch.LongTensor shape (L,) với L = max_len nếu max_len được truyền, ngược lại length thực tế.
-        """
-        # 1) Tokenize (thay bằng tokenizer của bạn nếu cần)
-        if isinstance(sentence, (list, tuple)):
-            tokens = list(sentence)
-        else:
-            tokens = sentence.strip().split()
-
-        # 2) Map token -> index, dùng unk nếu không tồn tại
-        indices = [self.stoi.get(t, getattr(self, 'unk_idx', 1)) for t in tokens]
-
-        # 3) Thêm eos nếu cần
-        if add_eos:
-            eos_idx = self.stoi.get(eos_token, None)
-            if eos_idx is None:
-                # nếu vocab không có eos token, thêm vào bằng unk_idx
-                eos_idx = getattr(self, 'unk_idx', 1)
-            indices.append(eos_idx)
-
-        # 4) Nếu max_len được truyền, cắt hoặc pad
-        if max_len is not None:
-            if len(indices) > max_len:
-                indices = indices[:max_len]
-            else:
-                pad_idx = getattr(self, 'pad_idx', 0)
-                indices = indices + [pad_idx] * (max_len - len(indices))
-
-        # 5) Trả về tensor long (hoặc list nếu bạn muốn)
-        return torch.tensor(indices, dtype=torch.long)
-class Flickr8kDataset(Dataset):
-    """
-    Flickr8k dataset loader.
-    Returns:
-      image (Tensor), encoded_caption (LongTensor), image_filename (str), list_of_refs (list[str])
-    Notes:
-      - Keep transforms light and deterministic for better cuDNN kernel selection.
-      - This version tries multiple common image-folder names and will search for images if needed.
-    """
-    def __init__(self, root, split='train', transform=None, vocab=None, max_len=30):
-        self.root = root
-        text_dir = os.path.join(root, 'Flickr8k_text')
-        token_file = os.path.join(text_dir, 'Flickr8k.token.txt')
-        if not os.path.exists(token_file):
-            raise FileNotFoundError(f"Cannot find {token_file}. Place Flickr8k.token.txt in {text_dir}")
-        # read tokens
-        self.captions = {}  # img -> list of captions
-        with open(token_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                parts = line.strip().split('\t')
-                if len(parts) < 2:
-                    continue
-                key, cap = parts[0], parts[1]
-                img = key.split('#')[0]
-                self.captions.setdefault(img, []).append(cap)
-
-        # splits
-        split_file = os.path.join(text_dir, f'Flickr_8k.{split}Images.txt')
-        if not os.path.exists(split_file):
-            img_list = list(self.captions.keys())
-        else:
-            with open(split_file, 'r', encoding='utf-8') as f:
-                img_list = [l.strip() for l in f.readlines() if l.strip()]
-
-        # try several common image directory names
-        candidate_dirs = [
-            os.path.join(root, 'Flickr_8k_Dataset'),
-            os.path.join(root, 'Flickr8k_Dataset'),
-            os.path.join(root, 'Flickr_8k_dataset'),
-            os.path.join(root, 'images'),
-            root  # fallback: images might be directly in root
-        ]
-        img_dir = None
-        for d in candidate_dirs:
-            if os.path.exists(d) and any(f.lower().endswith('.jpg') or f.lower().endswith('.jpeg') for f in os.listdir(d)):
-                img_dir = d
-                break
-
-        if img_dir is None:
-            # try to find any jpg under root recursively
-            found = glob.glob(os.path.join(root, '**', '*.jpg'), recursive=True)
-            if found:
-                # pick parent folder of first found as img_dir
-                img_dir = os.path.dirname(found[0])
-                print(f"[dataset] Warning: using discovered image folder: {img_dir}")
-            else:
-                raise FileNotFoundError(f"Cannot find image directory under {root}. Expected one of {candidate_dirs} or any .jpg file recursively.")
-
-        # build full image paths, but check existence. If missing, try to search for the file anywhere under root.
-        resolved_images = []
-        missing_imgs = []
-        for im in img_list:
-            candidate = os.path.join(img_dir, im)
-            if os.path.exists(candidate):
-                resolved_images.append(candidate)
-            else:
-                # try to find im anywhere under root
-                matches = glob.glob(os.path.join(root, '**', im), recursive=True)
-                if matches:
-                    resolved_images.append(matches[0])
-                else:
-                    missing_imgs.append(im)
-
-        if missing_imgs:
-            print(f"[dataset] Warning: {len(missing_imgs)} referenced images not found. They will be skipped. Example missing: {missing_imgs[:5]}")
-
-        self.images = resolved_images
-        # default transform (ImageNet-style) - keep deterministic resize and normalization
-        if transform is None:
-            self.transform = T.Compose([
-                T.Resize((224, 224)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-            ])
-        else:
-            self.transform = transform
-
-        self.vocab = vocab
+class CaptionPatchDataset(Dataset):
+    def __init__(self, captions_json: str, features_dir: str, tokenizer_dir: str,
+                 max_len: int = 33, max_patches: int = 196,
+                 feature_norm: bool = True, dtype = np.float32):
+        super().__init__()
+        self.captions_json = captions_json
+        self.features_dir = features_dir
+        self.tokenizer_dir = tokenizer_dir
         self.max_len = max_len
+        self.max_patches = max_patches
+        self.feature_norm = feature_norm
+        self.dtype = dtype
+
+        self.raw_caps = _load_json_captions(captions_json)
+        self.tk = load_tokenizer(tokenizer_dir)
+        if self.tk.get("vocab") is None:
+            raise SystemExit("vocab.json not found in tokenizer_dir: " + tokenizer_dir)
+
+        self.caps: Dict[str, List[List[int]]] = {}
+        pad_id = self.tk["pad_id"]
+        bos_id = self.tk["bos_id"]
+        eos_id = self.tk["eos_id"]
+
+        for img_id, caps in self.raw_caps.items():
+            encs = []
+            for c in caps:
+                txt = c.strip()
+                ids = text_to_ids(txt, self.tk)
+                ids = ids[:(self.max_len - 2)]
+                ids = [bos_id] + ids + [eos_id]
+                if len(ids) < self.max_len:
+                    ids = ids + [pad_id] * (self.max_len - len(ids))
+                encs.append(ids)
+            if not encs:
+                ids = [bos_id, eos_id] + [pad_id] * (self.max_len - 2)
+                encs = [ids]
+            self.caps[str(img_id)] = encs
+
+        self.ids = list(self.caps.keys())
 
     def __len__(self):
-        return len(self.images)
+        return len(self.ids)
 
-    def __getitem__(self, idx):
-        img_path = self.images[idx]
-        img_name = os.path.basename(img_path)
-        # Load image (PIL) and apply transforms (fast if num_workers>0)
-        image = Image.open(img_path).convert('RGB')
-        image = self.transform(image)
-        captions = self.captions.get(img_name, [])
-        caption = captions[0] if captions else ""
-        if self.vocab is not None:
-            encoded = self.vocab.encode_sentence(caption, max_len=self.max_len)
-            # pad/truncate to max_len
-            if len(encoded) < self.max_len:
-                pad_idx = self.vocab.stoi.get('<pad>', 0)
-                encoded = encoded + [pad_idx] * (self.max_len - len(encoded))
+    def _find_feature_file(self, img_id: str):
+        base = os.path.join(self.features_dir, str(img_id))
+        for ext in [".npy", ".npz", ".pt", ".pth"]:
+            p = base + ext
+            if os.path.exists(p):
+                return p
+        # try matching by substring
+        for p in Path(self.features_dir).glob(f"*{img_id}*"):
+            if p.is_file():
+                return str(p)
+        return None
+
+    def _load_feature_array(self, path: str):
+        ext = Path(path).suffix.lower()
+        if ext == ".npy":
+            arr = np.load(path)
+        elif ext == ".npz":
+            data = np.load(path)
+            try:
+                arr = data["patch_feats"]
+            except Exception:
+                try:
+                    arr = data["arr_0"]
+                except Exception:
+                    keys = [k for k in data.files]
+                    arr = data[keys[0]]
+        elif ext in (".pt", ".pth"):
+            obj = torch.load(path, map_location="cpu")
+            if isinstance(obj, dict) and "features" in obj:
+                arr = obj["features"]
             else:
-                encoded = encoded[:self.max_len]
-            return image, torch.tensor(encoded, dtype=torch.long), img_name, captions
+                arr = obj
+            if isinstance(arr, torch.Tensor):
+                arr = arr.numpy()
         else:
-            return image, caption, img_name, captions
+            raise FileNotFoundError(f"Unsupported feature file type: {path}")
+        return arr
+
+    def _normalize_features(self, feats: np.ndarray):
+        if feats.ndim == 1:
+            feats = feats[np.newaxis, :]
+        if feats.ndim == 3:
+            feats = np.squeeze(feats)
+            if feats.ndim == 1:
+                feats = feats[np.newaxis, :]
+        N, D = feats.shape[0], feats.shape[1]
+        if N > self.max_patches:
+            feats = feats[:self.max_patches, :]
+        elif N < self.max_patches:
+            pad = np.zeros((self.max_patches - N, D), dtype=feats.dtype)
+            feats = np.vstack([feats, pad])
+        feats = feats.astype(self.dtype, copy=False)
+        if self.feature_norm:
+            norms = np.linalg.norm(feats, axis=1, keepdims=True)
+            norms = norms + 1e-12
+            feats = feats / norms
+        return feats
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        fpath = self._find_feature_file(img_id)
+        if fpath is None:
+            raise FileNotFoundError(f"No feature file for image id {img_id} in {self.features_dir}")
+        arr = self._load_feature_array(fpath)
+        feats = self._normalize_features(arr)
+        feats_tensor = torch.from_numpy(feats).float()
+        caps_for_img = self.caps[img_id]
+        tgt_ids = caps_for_img[np.random.randint(len(caps_for_img))]
+        tgt_tensor = torch.tensor(tgt_ids, dtype=torch.long)
+        return feats_tensor, tgt_tensor, img_id
+
+def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, Any]]):
+    import torch as _torch
+    feats_list = [item[0] for item in batch]
+    tgts_list = [item[1] for item in batch]
+    ids = [item[2] for item in batch]
+    feats_list = [_torch.as_tensor(f).float() for f in feats_list]
+    tgts_list = [_torch.as_tensor(t).long() for t in tgts_list]
+    feats_batch = _torch.stack(feats_list, dim=0)
+    tgts_batch = _torch.stack(tgts_list, dim=0)
+    return feats_batch, tgts_batch, ids
